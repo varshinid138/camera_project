@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video and Audio Recording</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            flex-direction: column;
+        }
+
+        #video-container {
+            width: 640px;
+            height: 480px;
+            background-color: black;
+            margin-bottom: 20px;
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+        }
+
+        #controls {
+            margin-top: 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            background-color: #007bff;
+            color: white;
+        }
+
+        button:hover {
+            background-color: #0056b3;
+        }
+
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+
+    </style>
+</head>
+<body>
+    <h1>Video and Audio Recording</h1>
+    <div id="video-container">
+        <img id="video-feed" src="{{ url_for('video_feed') }}" alt="Video Feed">
+    </div>
+
+    <div id="controls">
+        <button id="start-btn" onclick="startRecording()">Start Recording</button>
+        <button id="stop-btn" onclick="stopRecording()" disabled>Stop Recording</button>
+        <button id="ask_question" onclick="askQuestion()">Ask</button>
+
+    </div>
+
+    <script>
+        function startRecording() {
+            fetch('/start')
+                .then(response => response.json())
+                .then(data => {
+                    console.log(data.message);
+                    document.getElementById('start-btn').disabled = true;
+                    document.getElementById('stop-btn').disabled = false;
+                })
+                .catch(error => console.error('Error starting recording:', error));
+        }
+
+        function stopRecording() {
+            fetch('/stop')
+                .then(response => response.json())
+                .then(data => {
+                    console.log(data.message);
+                    document.getElementById('start-btn').disabled = false;
+                    document.getElementById('stop-btn').disabled = true;
+                })
+                .catch(error => console.error('Error stopping recording:', error));
+        }
+        function askQuestion() {
+            fetch('/ask_question')
+                .then(response => response.json())
+                .then(data => {
+                    console.log(data.message);
+                    let audio = new Audio(data.question_audio_url);
+                    audio.play();
+                })
+                .catch(error => console.error('Error asking question:', error));
+        }
+    </script>
+</body>
+</html>
