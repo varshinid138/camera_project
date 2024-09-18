@@ -16,13 +16,14 @@ import queue
 from playsound import playsound
 import pyaudio
 import keyboard
+import json
 
 app = Flask(__name__)
 
-FORMAT = pyaudio.paInt16  # Correct format for audio recording
-CHANNELS = 1  # Set to 1 for mono and 2 for stereo
-RATE = 44100  # Sample rate in Hertz
-CHUNK = 1024  # Buffer size for audio stream
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
+CHUNK = 1024
 
 # Audio processing globals
 audio_queue = queue.Queue()
@@ -36,134 +37,127 @@ video_capture = None
 output_frame = None
 video_lock = threading.Lock()
 
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# Load the face detection and landmark prediction models
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
-
+# Constants for gaze detection
 LEFT_EYE_INDICES = [36, 37, 38, 39, 40, 41]
 RIGHT_EYE_INDICES = [42, 43, 44, 45, 46, 47]
-GAZE_THRESHOLD = 0.25
-HISTORY_LENGTH = 5
 EYE_AR_THRESH = 0.2
-CHECK_INTERVAL = 3
-PICTURE_THRESHOLD = 5
+GAZE_THRESH = 5
 
+# New variables for moving average
+gaze_history = []
+history_length = 10
 
-prev_gray = None
-face_motions = {}
-last_check_time = time.time()
+total_frames = 0
+center_frames = 0
+two_person_frames = 0
+start_time = None
 
-
-audio_queue = queue.Queue()
-audio_stream = None
-fs = 44100  # Sample rate
-
-# Video processing functions
 def eye_aspect_ratio(eye):
     A = dist.euclidean(eye[1], eye[5])
     B = dist.euclidean(eye[2], eye[4])
     C = dist.euclidean(eye[0], eye[3])
-    ear = (A + B) / (2.0 * C)
-    return ear
+    return (A + B) / (2.0 * C)
 
-def get_eye_center(landmarks, eye_indices):
-    return np.mean([(landmarks.part(i).x, landmarks.part(i).y) for i in eye_indices], axis=0)
+def detect_pupil(eye_region, frame):
+    if eye_region.size == 0:
+        return None
+    try:
+        gray_eye = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY)
+        _, thresh_eye = cv2.threshold(gray_eye, 70, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(thresh_eye, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            M = cv2.moments(largest_contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                return (cx, cy)
+    except Exception as e:
+        print(f"Error in detect_pupil: {e}")
+    return None
 
-def detect_gaze(landmarks):
-    left_eye = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in LEFT_EYE_INDICES])
-    right_eye = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in RIGHT_EYE_INDICES])
-    
+def detect_gaze(landmarks, frame):
+    def get_eye_points(indices):
+        return np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in indices])
+
+    left_eye = get_eye_points(LEFT_EYE_INDICES)
+    right_eye = get_eye_points(RIGHT_EYE_INDICES)
+
     left_ear = eye_aspect_ratio(left_eye)
     right_ear = eye_aspect_ratio(right_eye)
     avg_ear = (left_ear + right_ear) / 2.0
-    
-    if avg_ear < EYE_AR_THRESH:
-        return False, " "
-    
-    left_eye_center = get_eye_center(landmarks, LEFT_EYE_INDICES)
-    right_eye_center = get_eye_center(landmarks, RIGHT_EYE_INDICES)
-    eyes_center = np.mean([left_eye_center, right_eye_center], axis=0)
-    
-    nose_bridge = np.array([landmarks.part(30).x, landmarks.part(30).y])
-    face_width = landmarks.part(16).x - landmarks.part(0).x
-    
-    distance = np.linalg.norm(eyes_center - nose_bridge)
-    looking_at_camera = (distance / face_width) < GAZE_THRESHOLD
-    
-    return looking_at_camera, " " if looking_at_camera else " "
 
-def detect_bounding_box(vid):
-    gray_image = cv2.cvtColor(vid, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray_image, 1.1, 5, minSize=(40, 40))
-    return faces
+    if avg_ear < EYE_AR_THRESH:
+        return "Eyes Closed", frame
+
+    left_eye_center = np.mean(left_eye, axis=0).astype(int)
+    right_eye_center = np.mean(right_eye, axis=0).astype(int)
+    center_point = ((left_eye_center + right_eye_center) / 2).astype(int)
+
+    h, w = frame.shape[:2]
+    left_eye_region = frame[max(0, left_eye_center[1]-10):min(h, left_eye_center[1]+10), 
+                            max(0, left_eye_center[0]-15):min(w, left_eye_center[0]+15)]
+    right_eye_region = frame[max(0, right_eye_center[1]-10):min(h, right_eye_center[1]+10), 
+                             max(0, right_eye_center[0]-15):min(w, right_eye_center[0]+15)]
+
+    left_pupil = detect_pupil(left_eye_region, frame)
+    right_pupil = detect_pupil(right_eye_region, frame)
+
+    if left_pupil is None or right_pupil is None:
+        return "Pupil not detected", frame
+
+    left_pupil_pos = (left_eye_center[0] - 15 + left_pupil[0], left_eye_center[1] - 10 + left_pupil[1])
+    right_pupil_pos = (right_eye_center[0] - 15 + right_pupil[0], right_eye_center[1] - 10 + right_pupil[1])
+
+    left_distance = center_point[0] - left_pupil_pos[0]
+    right_distance = right_pupil_pos[0] - center_point[0]
+
+    cv2.circle(frame, tuple(center_point), 3, (255, 0, 0), -1)
+    cv2.circle(frame, left_pupil_pos, 3, (0, 255, 0), -1)
+    cv2.circle(frame, right_pupil_pos, 3, (0, 255, 0), -1)
+
+    if abs(left_distance - right_distance) < GAZE_THRESH:
+        return "Center", frame
+    elif left_distance > right_distance:
+        return "Right", frame
+    else:
+        return "Left", frame
 
 def process_frame(frame):
-    global prev_gray, last_check_time, face_motions
+    global total_frames, center_frames, two_person_frames, gaze_history
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces_cv = detect_bounding_box(frame)
-    faces_dlib = detector(gray)
-
-    face_areas = [w * h for (x, y, w, h) in faces_cv]
-    main_interviewer_idx = face_areas.index(max(face_areas)) if face_areas else None
-
-    current_time = time.time()
-
-    if current_time - last_check_time >= CHECK_INTERVAL:
-        last_check_time = current_time
-
-        if prev_gray is not None and len(faces_cv) > 0:
-            for i, (x, y, w, h) in enumerate(faces_cv):
-                face_id = f"face_{i}"
-
-                face_diff = cv2.absdiff(prev_gray[y:y+h, x:x+w], gray[y:y+h, x:x+w])
-                _, face_thresh = cv2.threshold(face_diff, 25, 255, cv2.THRESH_BINARY)
-                motion_pixels = cv2.countNonZero(face_thresh)
-
-                if motion_pixels > 50:
-                    face_motions[face_id] = {"last_motion": current_time, "status": "person detected"}
-                elif face_id not in face_motions:
-                    face_motions[face_id] = {"last_motion": current_time - PICTURE_THRESHOLD - 1, "status": "picture detected"}
-
-    for face_id, data in face_motions.items():
-        if current_time - data["last_motion"] >= PICTURE_THRESHOLD:
-            data["status"] = " "
-        else:
-            data["status"] = " "
-
-    gaze_history = deque(maxlen=HISTORY_LENGTH)
-    looking_at_camera = False
-    gaze_status = " "
-
-    for face in faces_dlib:
+    faces = detector(gray)
+    
+    if len(faces) == 2:
+        two_person_frames += 1
+        cv2.putText(frame, "Two Persons Detected", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    
+    for face in faces:
         landmarks = predictor(gray, face)
-        looking_at_camera, gaze_status = detect_gaze(landmarks)
-        gaze_history.append(looking_at_camera)
-        
-        x, y, w, h = face.left(), face.top(), face.width(), face.height()
-        color = (0, 255, 0) if looking_at_camera else (0, 0, 255)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-
-    looking_at_camera = sum(gaze_history) > len(gaze_history) // 2
-
-    for i, (x, y, w, h) in enumerate(faces_cv):
-        face_id = f"face_{i}"
-
-        if face_id in face_motions:
-            status = face_motions[face_id]["status"]
-            color = (0, 255, 0) if status == "person detected" else (0, 0, 255)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 4)
-            cv2.putText(frame, status, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        if i == main_interviewer_idx:
-            cv2.putText(frame, '', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        elif face_areas[i] < face_areas[main_interviewer_idx] * 0.6:
-            cv2.putText(frame, '', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-
-    cv2.putText(frame, gaze_status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-    prev_gray = gray.copy()
+        try:
+            gaze_direction, frame = detect_gaze(landmarks, frame)
+            
+            gaze_history.append(gaze_direction)
+            if len(gaze_history) > history_length:
+                gaze_history.pop(0)
+            
+            smoothed_gaze = max(set(gaze_history), key=gaze_history.count)
+            
+            if smoothed_gaze == "Center":
+                center_frames += 1
+                cv2.putText(frame, "Center", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(frame, smoothed_gaze, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        except Exception as e:
+            print(f"Error in gaze detection: {e}")
+    
+    total_frames += 1
     
     return frame
 
@@ -182,8 +176,9 @@ def generate():
             bytearray(encodedImage) + b'\r\n')
 
 def process_video():
-    global  output_frame, video_lock, video_capture
+    global output_frame, video_lock, video_capture, start_time
     
+    start_time = time.time()
     while video_capture.isOpened():
         ret, frame = video_capture.read()
         if not ret:
@@ -194,17 +189,41 @@ def process_video():
         with video_lock:
             output_frame = frame.copy()
 
+        if time.time() - start_time >= 120:  # Run for 120 seconds
+            break
+
+    # After video processing, save results
+    save_results()
+
+def save_results():
+    global total_frames, center_frames, two_person_frames
+
+    percentage_looking_at_center = (center_frames / total_frames) * 100 if total_frames else 0
+    percentage_two_persons = (two_person_frames / total_frames) * 100 if total_frames else 0
+
+    results = {
+        "total_frames": total_frames,
+        "frames_looking_at_center": center_frames,
+        "frames_with_two_persons": two_person_frames,
+        "percentage_looking_at_center": round(percentage_looking_at_center, 2),
+        "percentage_frames_with_two_persons": round(percentage_two_persons, 2),
+        "success": percentage_looking_at_center >= 70
+    }
+
+    with open('gaze_analysis_results.json', 'w') as f:
+        json.dump(results, f, indent=4)
+
+    print("Analysis complete. Results have been saved to gaze_analysis_results.json")
+
+# Rest of the code remains the same...
+
 def save_to_wav(filename):
-    
     try:
-        # Create a wave file and set its parameters
         with wave.open(filename, 'wb') as wf:
-            # Check and set the number of channels (should be 1 or 2 typically)
             if CHANNELS not in [1, 2]:
                 raise ValueError(f"Invalid number of channels: {CHANNELS}. Should be 1 (mono) or 2 (stereo).")
             wf.setnchannels(CHANNELS)
             
-            # Get the sample width from the PyAudio format
             audio = pyaudio.PyAudio()
             sample_width = audio.get_sample_size(FORMAT)
             
@@ -212,16 +231,13 @@ def save_to_wav(filename):
                 raise ValueError(f"Invalid format for sample width: {FORMAT}")
             wf.setsampwidth(sample_width)
             
-            # Check and set the frame rate (sampling rate)
             if RATE <= 0:
                 raise ValueError(f"Invalid sample rate: {RATE}. It should be a positive integer.")
             wf.setframerate(RATE)
             
-            # Write the audio frames to the file
             wf.writeframes(b''.join(audio_frames))
     except Exception as e:
         print(f"Error saving WAV file: {e}")
-
 
 def audio_recording_thread():
     global is_recording, audio_frames
@@ -240,12 +256,10 @@ def audio_recording_thread():
 def start_recording():
     global is_recording, video_capture
     
-    # Start Video Capture
     if video_capture is None or not video_capture.isOpened():
         video_capture = cv2.VideoCapture(0)
         threading.Thread(target=process_video).start()
 
-    # Start Audio Capture
     is_recording = True
     threading.Thread(target=audio_recording_thread).start()
     print("Recording started (audio and video)")
@@ -253,7 +267,6 @@ def start_recording():
 def stop_recording():
     global is_recording, video_capture
     
-    # Stop Audio Capture
     is_recording = False
     save_to_wav(RECORDING_FILENAME)
     print("Recording stopped (audio and video)")
@@ -262,45 +275,34 @@ folder1 = 'C:/Users/VARSHINI/OneDrive/Desktop/Camera Project/static/questions/dl
 folder2 = 'C:/Users/VARSHINI/OneDrive/Desktop/Camera Project/static/questions/mlq'
 folder3 = 'C:/Users/VARSHINI/OneDrive/Desktop/Camera Project/static/questions/statq'
 
-# Dictionary to keep track of used files in each folder
 used_files = {
     folder1: set(),
     folder2: set(),
     folder3: set()
 }
 
-# Initialize current_folder to None
 current_folder = None
 
 def get_random_audio(exclude_folder=None):
-    # List of all folders
     folders = [folder1, folder2, folder3]
     
-    # Exclude the current folder to ensure next selection is from a different folder
     if exclude_folder:
         folders = [folder for folder in folders if folder != exclude_folder]
     
-    # Randomly select a new folder
     new_folder = random.choice(folders)
     
-    # Get all audio files in the selected folder
     all_files = [f for f in os.listdir(new_folder) if f.endswith(('.mp3', '.wav'))]
     
-    # Get the set of used files in this folder
     used = used_files[new_folder]
     
-    # Determine available files by excluding used files
     available_files = list(set(all_files) - used)
     
-    # If all files have been used, reset the used_files set for this folder
     if not available_files:
         used_files[new_folder] = set()
         available_files = all_files
     
-    # Select a random audio file from available files
     selected_file = random.choice(available_files)
     
-    # Add the selected file to the used_files set
     used_files[new_folder].add(selected_file)
     
     return new_folder, selected_file
@@ -315,16 +317,11 @@ def ask_question():
     
     audio_file_path = os.path.join(new_folder, selected_file)
     
-    # Use threading to avoid blocking the Flask route while playing the audio
     threading.Thread(target=playsound, args=(audio_file_path,)).start()
     
-    # Provide the audio file URL to the client
     question_audio_url = url_for('static', filename=os.path.join('questions', new_folder.split('/')[-1], selected_file))
     
     return jsonify({"message": "Playing question", "question_audio_url": question_audio_url})
-
-    
-
 
 @app.route("/video_feed")
 def video_feed():
@@ -345,9 +342,6 @@ def stop_recording_route():
 def index():
     return render_template('index.html')
 
-
-
-
 if __name__ == "__main__":
     video_capture = cv2.VideoCapture(0)
     t = threading.Thread(target=process_video)
@@ -357,3 +351,6 @@ if __name__ == "__main__":
         threaded=True, use_reloader=False)
 
     video_capture.release()
+
+
+    
