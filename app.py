@@ -32,6 +32,7 @@ audio_frames = []
 is_recording = False
 RECORDING_FILENAME = "output.wav"
 
+
 # Video processing globals
 video_capture = None
 output_frame = None
@@ -44,17 +45,16 @@ predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 # Constants for gaze detection
 LEFT_EYE_INDICES = [36, 37, 38, 39, 40, 41]
 RIGHT_EYE_INDICES = [42, 43, 44, 45, 46, 47]
-EYE_AR_THRESH = 0.2
-GAZE_THRESH = 5
+EYE_AR_THRESH = 0.2  # Eye Aspect Ratio threshold
+GAZE_THRESH = 6  # Increased threshold for determining gaze direction (in pixels)
 
 # New variables for moving average
-gaze_history = []
-history_length = 10
-
 total_frames = 0
 center_frames = 0
 two_person_frames = 0
-start_time = None
+gaze_history = []
+history_length = 10
+frame_data = []  # To store frame-by-frame data
 
 def eye_aspect_ratio(eye):
     A = dist.euclidean(eye[1], eye[5])
@@ -129,10 +129,16 @@ def detect_gaze(landmarks, frame):
         return "Left", frame
 
 def process_frame(frame):
-    global total_frames, center_frames, two_person_frames, gaze_history
+    global total_frames, center_frames, two_person_frames, gaze_history, frame_data
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = detector(gray)
+    
+    frame_info = {
+        "frame_number": total_frames,
+        "gaze_direction": None,
+        "faces_detected": len(faces)
+    }
     
     if len(faces) == 2:
         two_person_frames += 1
@@ -149,6 +155,8 @@ def process_frame(frame):
             
             smoothed_gaze = max(set(gaze_history), key=gaze_history.count)
             
+            frame_info["gaze_direction"] = smoothed_gaze
+            
             if smoothed_gaze == "Center":
                 center_frames += 1
                 cv2.putText(frame, "Center", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -158,6 +166,7 @@ def process_frame(frame):
             print(f"Error in gaze detection: {e}")
     
     total_frames += 1
+    frame_data.append(frame_info)
     
     return frame
 
@@ -176,7 +185,7 @@ def generate():
             bytearray(encodedImage) + b'\r\n')
 
 def process_video():
-    global output_frame, video_lock, video_capture, start_time
+    global output_frame, video_lock, video_capture
     
     start_time = time.time()
     while video_capture.isOpened():
@@ -189,14 +198,55 @@ def process_video():
         with video_lock:
             output_frame = frame.copy()
 
-        if time.time() - start_time >= 120:  # Run for 120 seconds
-            break
+        
 
-    # After video processing, save results
     save_results()
 
+    
+
+def get_next_session_number(filename='gaze_analysis_results.json'):
+    # If file exists, load the existing data to find the next session number
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            try:
+                existing_data = json.load(f)
+                # Check if the data contains any sessions
+                if isinstance(existing_data, list) and len(existing_data) > 0:
+                    last_session = existing_data[-1]
+                    last_session_name = list(last_session.keys())[0]
+                    last_session_number = int(last_session_name.split()[-1])
+                    return last_session_number + 1
+            except (json.JSONDecodeError, ValueError, KeyError):
+                pass  # If there's any issue, start from Session 1
+    return 1
+
+def append_results_to_json(new_data, filename='gaze_analysis_results.json'):
+    # If file exists, load the existing data
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            try:
+                existing_data = json.load(f)
+                # Ensure that existing_data is a list; if it's not, convert it to a list
+                if isinstance(existing_data, dict):
+                    existing_data = [existing_data]
+            except json.JSONDecodeError:
+                existing_data = []
+    else:
+        existing_data = []
+
+    # Get the next session number and label it
+    next_session_number = get_next_session_number(filename)
+    session_key = f"Session {next_session_number}"
+    
+    # Append the new data as a session
+    existing_data.append({session_key: new_data})
+
+    # Write the updated data back to the file
+    with open(filename, 'w') as f:
+        json.dump(existing_data, f, indent=4)
+
 def save_results():
-    global total_frames, center_frames, two_person_frames
+    global total_frames, center_frames, two_person_frames, frame_data
 
     percentage_looking_at_center = (center_frames / total_frames) * 100 if total_frames else 0
     percentage_two_persons = (two_person_frames / total_frames) * 100 if total_frames else 0
@@ -207,15 +257,17 @@ def save_results():
         "frames_with_two_persons": two_person_frames,
         "percentage_looking_at_center": round(percentage_looking_at_center, 2),
         "percentage_frames_with_two_persons": round(percentage_two_persons, 2),
-        "success": percentage_looking_at_center >= 70
+        "success": percentage_looking_at_center >= 70,
+        "frame_data": frame_data
     }
 
-    with open('gaze_analysis_results.json', 'w') as f:
-        json.dump(results, f, indent=4)
+    try:
+        # Append results to the JSON file
+        append_results_to_json(results, 'gaze_analysis_results.json')
+        print("Analysis complete. Results have been saved to gaze_analysis_results.json")
+    except Exception as e:
+        print(f"Error saving results: {e}")
 
-    print("Analysis complete. Results have been saved to gaze_analysis_results.json")
-
-# Rest of the code remains the same...
 
 def save_to_wav(filename):
     try:
@@ -270,7 +322,7 @@ def stop_recording():
     is_recording = False
     save_to_wav(RECORDING_FILENAME)
     print("Recording stopped (audio and video)")
-    
+
 folder1 = 'C:/Users/VARSHINI/OneDrive/Desktop/Camera Project/static/questions/dlq'
 folder2 = 'C:/Users/VARSHINI/OneDrive/Desktop/Camera Project/static/questions/mlq'
 folder3 = 'C:/Users/VARSHINI/OneDrive/Desktop/Camera Project/static/questions/statq'
@@ -326,7 +378,7 @@ def ask_question():
 @app.route("/video_feed")
 def video_feed():
     return Response(generate(),
-                    mimetype = "multipart/x-mixed-replace; boundary=frame")
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
 @app.route('/start')
 def start_recording_route():
@@ -347,10 +399,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=process_video)
     t.daemon = True
     t.start()
-    app.run(host="0.0.0.0", port="5000", debug=True,
-        threaded=True, use_reloader=False)
-
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True, use_reloader=False)
     video_capture.release()
 
 
-    
