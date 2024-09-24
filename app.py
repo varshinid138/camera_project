@@ -395,7 +395,9 @@ def index():
     return render_template('index.html')
 
 if __name__ == "__main__":
-    video_capture = cv2.VideoCapture(0)
+    video_capture = cv2.VideoCapture()
+    if not video_capture.isOpened():
+        print("Error: Could not open video device.")
     t = threading.Thread(target=process_video)
     t.daemon = True
     t.start()
